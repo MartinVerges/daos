@@ -1050,9 +1050,11 @@ rdb_raft_append_node(struct rdb *db, uint64_t index, d_rank_t rank)
 	rc = daos_rank_list_append(db->d_replicas, rank);
 	if (rc != 0)
 		goto out;
+#if 0
 	rc = rdb_raft_add_node(db, rank);
 	if (rc != 0)
 		goto out;
+#endif
 	rc = rdb_lc_store_replicas(db->d_lc, index, db->d_replicas);
 out:
 	result = rdb_raft_lookup_result(db, index);
@@ -2252,6 +2254,7 @@ rdb_raft_load_entry(struct rdb *db, uint64_t index)
 		entry.data.buf = NULL;
 	}
 
+#if 0
 	/*
 	 * Raft requires that every node affected by a membership change entry
 	 * be present in the node list when that entry gets applied
@@ -2265,6 +2268,7 @@ rdb_raft_load_entry(struct rdb *db, uint64_t index)
 				return rc;
 		}
 	}
+#endif
 
 	/*
 	 * Since rdb_raft_cbs is not registered yet, we won't enter

@@ -57,6 +57,7 @@ struct rdb {
 
 	/* rdb_raft fields */
 	raft_server_t	       *d_raft;
+	bool			d_raft_loaded;	/* from storage (see rdb_raft_load) */
 	ABT_mutex		d_raft_mutex;	/* for raft state machine */
 	daos_handle_t		d_lc;		/* log container */
 	struct rdb_lc_record	d_lc_record;	/* of d_lc */

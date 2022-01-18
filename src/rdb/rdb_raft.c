@@ -236,7 +236,7 @@ rdb_raft_add_node(struct rdb *db, d_rank_t rank)
 	d_rank_t		 self;
 	int			 rc = 0;
 
-	D_ALLOC_PTR(dnode);
+	dnode = calloc(1, sizeof(*dnode));
 	if (dnode == NULL)
 		D_GOTO(out, rc = -DER_NOMEM);
 	rc = crt_group_rank(NULL, &self);
@@ -245,7 +245,7 @@ rdb_raft_add_node(struct rdb *db, d_rank_t rank)
 	node = raft_add_node(db->d_raft, dnode, rank, (rank == self));
 	if (node == NULL) {
 		D_ERROR(DF_DB": failed to add node %u\n", DP_DB(db), rank);
-		D_FREE(dnode);
+		free(dnode);
 		D_GOTO(out, rc = -DER_NOMEM);
 	}
 out:
@@ -309,16 +309,12 @@ rdb_raft_unload_replicas(struct rdb *db)
 		return;
 
 	for (i = 0; i < db->d_replicas->rl_nr; i++) {
-		raft_node_t	       *node;
-		struct rdb_raft_node   *rdb_node;
+		raft_node_t *node;
 
 		node = raft_get_node(db->d_raft, db->d_replicas->rl_ranks[i]);
 		if (node == NULL)
 			continue;
-		rdb_node = raft_node_get_udata(node);
-		D_ASSERT(rdb_node != NULL);
 		raft_remove_node(db->d_raft, node);
-		D_FREE(rdb_node);
 	}
 
 	d_rank_list_free(db->d_replicas);
@@ -1003,12 +999,16 @@ rdb_raft_cb_persist_vote(raft_server_t *raft, void *arg, raft_node_id_t vote)
 	d_iov_t		value;
 	int		rc;
 
+	if (!db->d_raft_loaded)
+		return 0;
+
 	d_iov_set(&value, &vote, sizeof(vote));
 	rc = rdb_mc_update(db->d_mc, RDB_MC_ATTRS, 1 /* n */, &rdb_mc_vote,
 			   &value);
 	if (rc != 0)
 		D_ERROR(DF_DB": failed to persist vote %d: %d\n", DP_DB(db),
 			vote, rc);
+
 	return rc;
 }
 
@@ -1021,6 +1021,9 @@ rdb_raft_cb_persist_term(raft_server_t *raft, void *arg, raft_term_t term,
 	d_iov_t		values[2];
 	int		rc;
 
+	if (!db->d_raft_loaded)
+		return 0;
+
 	/* Update rdb_mc_term and rdb_mc_vote atomically. */
 	keys[0] = rdb_mc_term;
 	d_iov_set(&values[0], &term, sizeof(term));
@@ -1030,6 +1033,7 @@ rdb_raft_cb_persist_term(raft_server_t *raft, void *arg, raft_term_t term,
 	if (rc != 0)
 		D_ERROR(DF_DB": failed to update term %ld and vote %d: %d\n",
 			DP_DB(db), term, vote, rc);
+
 	return rc;
 }
 
@@ -1098,11 +1102,19 @@ out:
 	return rc;
 }
 
+static d_rank_t
+rdb_raft_cfg_entry_rank(raft_entry_t *entry)
+{
+	D_ASSERT(entry->data.buf != NULL);
+	D_ASSERTF(entry->data.len == sizeof(d_rank_t), "%u\n", entry->data.len);
+	return *((d_rank_t *)entry->data.buf);
+}
+
 /* Caller must hold d_raft_mutex. */
 static int
 rdb_raft_update_node(struct rdb *db, uint64_t index, raft_entry_t *entry)
 {
-	d_rank_t rank = *(d_rank_t *)entry->data.buf;
+	d_rank_t rank = rdb_raft_cfg_entry_rank(entry);
 	int	 rc = 0;
 
 	switch (entry->type) {
@@ -1127,10 +1139,8 @@ rdb_raft_update_node(struct rdb *db, uint64_t index, raft_entry_t *entry)
 }
 
 static int
-rdb_raft_log_offer_single(raft_server_t *raft, void *arg,
-			  raft_entry_t *entry, uint64_t index)
+rdb_raft_log_offer_single(struct rdb *db, raft_entry_t *entry, uint64_t index)
 {
-	struct rdb	       *db = arg;
 	d_iov_t			keys[2];
 	d_iov_t			values[2];
 	struct rdb_entry	header;
@@ -1234,16 +1244,20 @@ static int
 rdb_raft_cb_log_offer(raft_server_t *raft, void *arg, raft_entry_t *entries,
 		      raft_index_t index, int *n_entries)
 {
-	int	i;
-	int	rc = 0;
+	struct rdb     *db = arg;
+	int		i;
+	int		rc = 0;
+
+	if (!db->d_raft_loaded)
+		return 0;
 
 	for (i = 0; i < *n_entries; ++i) {
-		rc = rdb_raft_log_offer_single(raft, arg, &entries[i],
-					       index + i);
+		rc = rdb_raft_log_offer_single(db, &entries[i], index + i);
 		if (rc != 0)
 			break;
 	}
 	*n_entries = i;
+
 	return rc;
 }
 
@@ -1256,6 +1270,9 @@ rdb_raft_cb_log_poll(raft_server_t *raft, void *arg, raft_entry_t *entries,
 	uint64_t	base_term = db->d_lc_record.dlr_base_term;
 	d_iov_t		value;
 	int		rc;
+
+	if (!db->d_raft_loaded)
+		return 0;
 
 	D_DEBUG(DB_TRACE, DF_DB": polling [%ld, %ld]\n", DP_DB(db), index,
 		index + *n_entries - 1);
@@ -1292,6 +1309,9 @@ rdb_raft_cb_log_pop(raft_server_t *raft, void *arg, raft_entry_t *entry,
 	uint64_t	tail = db->d_lc_record.dlr_tail;
 	d_iov_t		value;
 	int		rc;
+
+	if (!db->d_raft_loaded)
+		return 0;
 
 	D_ASSERTF(i > db->d_lc_record.dlr_base, DF_U64" > "DF_U64"\n", i,
 		  db->d_lc_record.dlr_base);
@@ -1334,7 +1354,39 @@ static raft_node_id_t
 rdb_raft_cb_log_get_node_id(raft_server_t *raft, void *arg, raft_entry_t *entry,
 			    raft_index_t index)
 {
-	return *((d_rank_t *)entry->data.buf);
+	D_ASSERTF(raft_entry_is_cfg_change(entry), "index=%ld type=%d\n", index, entry->type);
+	return rdb_raft_cfg_entry_rank(entry);
+}
+
+static void
+rdb_raft_cb_notify_membership_event(raft_server_t *raft, void *udata, raft_node_t *node,
+				    raft_entry_t *entry, raft_membership_e type)
+{
+	struct rdb_raft_node *rdb_node = raft_node_get_udata(node);
+
+	switch (type) {
+	case RAFT_MEMBERSHIP_ADD:
+		if (rdb_node != NULL)
+			break;
+		D_ASSERT(rdb_node == NULL && entry != NULL);
+		rdb_node = calloc(1, sizeof(*rdb_node));
+		/*
+		 * Since we may be called from raft_offer_log or raft_pop_log,
+		 * from where it's difficult to handle errors due to batching,
+		 * assert that the allocation must succeed for the moment. Use
+		 * calloc instead of D_ALLOC_PTR to avoid being fault-injected.
+		 */
+		D_ASSERT(rdb_node != NULL);
+		rdb_node->dn_rank = rdb_raft_cfg_entry_rank(entry);
+		raft_node_set_udata(node, rdb_node);
+		break;
+	case RAFT_MEMBERSHIP_REMOVE:
+		D_ASSERT(rdb_node != NULL);
+		free(rdb_node);
+		break;
+	default:
+		D_ASSERTF(false, "invalid raft membership event type %d\n", type);
+	}
 }
 
 static void
@@ -1365,6 +1417,7 @@ static raft_cbs_t rdb_raft_cbs = {
 	.log_poll			= rdb_raft_cb_log_poll,
 	.log_pop			= rdb_raft_cb_log_pop,
 	.log_get_node_id		= rdb_raft_cb_log_get_node_id,
+	.notify_membership_event	= rdb_raft_cb_notify_membership_event,
 	.log				= rdb_raft_cb_debug
 };
 
@@ -2204,7 +2257,7 @@ rdb_raft_load_entry(struct rdb *db, uint64_t index)
 	 * be present in the node list when that entry gets applied
 	 */
 	if (raft_entry_is_cfg_change(&entry) && entry.data.buf != NULL) {
-		d_rank_t rank = *(d_rank_t *)entry.data.buf;
+		d_rank_t rank = rdb_raft_cfg_entry_rank(&entry);
 
 		if (raft_get_node(db->d_raft, rank) == NULL) {
 			rc = rdb_raft_add_node(db, rank);
@@ -2404,15 +2457,67 @@ rdb_raft_get_ae_max_size(void)
 	return value;
 }
 
-int
-rdb_raft_start(struct rdb *db)
+/*
+ * Load raft persistent state, if any. Our raft callbacks must be registered
+ * already, because rdb_raft_cb_notify_membership_event is required. We use
+ * db->d_raft_loaded to instruct some of our raft callbacks to avoid
+ * unnecessary write I/Os.
+ */
+static int
+rdb_raft_load(struct rdb *db)
 {
 	d_iov_t		value;
 	uint64_t	term;
 	int		vote;
-	int		election_timeout;
-	int		request_timeout;
 	int		rc;
+
+	D_DEBUG(DB_MD, DF_DB": load persistent state: begin\n", DP_DB(db));
+	D_ASSERT(!db->d_raft_loaded);
+
+	d_iov_set(&value, &term, sizeof(term));
+	rc = rdb_mc_lookup(db->d_mc, RDB_MC_ATTRS, &rdb_mc_term, &value);
+	if (rc == 0) {
+		rc = raft_set_current_term(db->d_raft, term);
+		D_ASSERTF(rc == 0, DF_RC"\n", DP_RC(rc));
+	} else if (rc != -DER_NONEXIST) {
+		goto out;
+	}
+
+	d_iov_set(&value, &vote, sizeof(vote));
+	rc = rdb_mc_lookup(db->d_mc, RDB_MC_ATTRS, &rdb_mc_vote, &value);
+	if (rc == 0) {
+		rc = raft_vote_for_nodeid(db->d_raft, vote);
+		D_ASSERTF(rc == 0, DF_RC"\n", DP_RC(rc));
+	} else if (rc != -DER_NONEXIST) {
+		goto out;
+	}
+
+	rc = rdb_raft_load_lc(db);
+	if (rc != 0)
+		goto out;
+
+	d_rank_list_free(db->d_replicas);
+	db->d_replicas = NULL;
+	rc = rdb_raft_load_replicas(db, db->d_lc_record.dlr_tail - 1);
+	if (rc == -DER_NONEXIST) {
+		rc = 0;
+	} else if (rc != 0) {
+		rdb_raft_unload_lc(db);
+		goto out;
+	}
+
+	db->d_raft_loaded = true;
+out:
+	D_DEBUG(DB_MD, DF_DB": load persistent state: end: "DF_RC"\n", DP_DB(db), DP_RC(rc));
+	return rc;
+}
+
+int
+rdb_raft_start(struct rdb *db)
+{
+	int	election_timeout;
+	int	request_timeout;
+	int	rc;
 
 	D_INIT_LIST_HEAD(&db->d_requests);
 	D_INIT_LIST_HEAD(&db->d_replies);
@@ -2466,38 +2571,13 @@ rdb_raft_start(struct rdb *db)
 		goto err_compact_cv;
 	}
 
-	/*
-	 * Read raft persistent state, if any. Done before setting the
-	 * callbacks in order to avoid unnecessary I/Os.
-	 */
-	d_iov_set(&value, &term, sizeof(term));
-	rc = rdb_mc_lookup(db->d_mc, RDB_MC_ATTRS, &rdb_mc_term, &value);
-	if (rc == 0) {
-		rc = raft_set_current_term(db->d_raft, term);
-		D_ASSERTF(rc == 0, ""DF_RC"\n", DP_RC(rc));
-	} else if (rc != -DER_NONEXIST) {
-		goto err_raft;
-	}
-	d_iov_set(&value, &vote, sizeof(vote));
-	rc = rdb_mc_lookup(db->d_mc, RDB_MC_ATTRS, &rdb_mc_vote, &value);
-	if (rc == 0) {
-		rc = raft_vote_for_nodeid(db->d_raft, vote);
-		D_ASSERTF(rc == 0, ""DF_RC"\n", DP_RC(rc));
-	} else if (rc != -DER_NONEXIST) {
-		goto err_raft;
-	}
-	rc = rdb_raft_load_lc(db);
-	if (rc != 0)
-		goto err_raft;
-
-	d_rank_list_free(db->d_replicas);
-	db->d_replicas = NULL;
-	rc = rdb_raft_load_replicas(db, db->d_lc_record.dlr_tail - 1);
-	if (rc != 0 && rc != -DER_NONEXIST)
-		goto err_lc;
-
-	/* Must be done after loading the persistent state. */
 	raft_set_callbacks(db->d_raft, &rdb_raft_cbs, db);
+
+	rc = rdb_raft_load(db);
+	if (rc != 0) {
+		D_ERROR(DF_DB": failed to load raft persistent state\n", DP_DB(db));
+		goto err_raft;
+	}
 
 	election_timeout = rdb_raft_get_election_timeout();
 	request_timeout = rdb_raft_get_request_timeout();

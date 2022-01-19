@@ -10,6 +10,7 @@
 #include <fcntl.h>
 #include <uuid/uuid.h>
 #include <abt.h>
+#include <spdk/string.h>
 #include <spdk/log.h>
 #include <spdk/env.h>
 #include <spdk/init.h>
@@ -80,7 +81,11 @@ static int
 bio_spdk_env_init(void)
 {
 	struct spdk_env_opts	 opts;
-	int			 rc;
+	char			 sock_mem_str[32] = "";
+	char			*buf = NULL;
+	int			 buflen;
+	int			 n = 0;
+	int			 rc = 0;
 
 	/* Only print error and more severe to stderr. */
 	spdk_log_set_print_level(SPDK_LOG_ERROR);
@@ -97,14 +102,37 @@ bio_spdk_env_init(void)
 		}
 	}
 
-	/*
+	/**
 	 * TODO: Set opts.mem_size to nvme_glb.bd_mem_size
 	 * Currently we can't guarantee clean shutdown (no hugepages leaked).
 	 * Setting mem_size could cause EAL: Not enough memory available error,
 	 * and DPDK will fail to initialize.
 	 */
 
-	opts.env_context = (char *)dpdk_cli_override_opts;
+	/**
+	 * Add socket memory size to DPDK env context opts to specify which NUMA node to use.
+	 * For any unsupported NUMA node IDs, don't supply socket memory param.
+	 * Socket memory for process's NUMA node will be set to 80% of mem_size to take into
+	 * account any extra overhead when preallocating in DPDK.
+	 */
+	if (nvme_glb.bd_numa_node == 0)
+		n = snprintf(sock_mem_str, sizeof(sock_mem_str), " --socket-mem %d,0",
+			     (nvme_glb.bd_mem_size * 80) / 100);
+	else if (nvme_glb.bd_numa_node == 1)
+		n = snprintf(sock_mem_str, sizeof(sock_mem_str), " --socket-mem 0,%d",
+			     (nvme_glb.bd_mem_size * 80) / 100);
+
+	buflen = strlen(dpdk_cli_override_opts) + n + 1;
+	D_ALLOC(buf, buflen);
+	if (buf == NULL) {
+		D_ERROR("Failed to allocate env_context buffer");
+		rc = -DER_NOMEM;
+		goto out;
+	}
+	snprintf(buf, buflen, "%s%s", dpdk_cli_override_opts, sock_mem_str);
+	D_DEBUG(DB_MGMT, "DPDK env context: %s\n", buf);
+
+	opts.env_context = (char *)buf;
 
 	if (bio_nvme_configured()) {
 		rc = bio_set_hotplug_filter(nvme_glb.bd_nvme_conf);
@@ -130,6 +158,8 @@ bio_spdk_env_init(void)
 		spdk_env_fini();
 	}
 out:
+	if (buf != NULL)
+		D_FREE(buf);
 	if (opts.pci_allowed != NULL)
 		D_FREE(opts.pci_allowed);
 	return rc;

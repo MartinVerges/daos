@@ -1,5 +1,5 @@
 //
-// (C) Copyright 2021 Intel Corporation.
+// (C) Copyright 2021-2022 Intel Corporation.
 //
 // SPDX-License-Identifier: BSD-2-Clause-Patent
 //
@@ -54,7 +54,11 @@ func (p *Provider) getFabricInterfaces(ch chan *fabricResult) {
 		}
 		return
 	}
-	defer cleanup()
+	defer func() {
+		if err := cleanup(); err != nil {
+			p.log.Errorf("unable to clean up fi_info: %s", err.Error())
+		}
+	}()
 
 	fis := hardware.NewFabricInterfaceSet()
 
